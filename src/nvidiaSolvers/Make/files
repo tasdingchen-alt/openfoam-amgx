@@ -1,0 +1,4 @@
+AmgXSolver/AmgXSolver.C
+AmgXSolver/ldu2csr.C
+
+LIB = $(FOAM_USER_LIBBIN)/libnvidiaSolvers

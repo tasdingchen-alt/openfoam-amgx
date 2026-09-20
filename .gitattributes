@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.C text eol=lf
+*.H text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+Allwmake text eol=lf
+Allwclean text eol=lf
+LICENSE text eol=lf

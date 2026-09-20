@@ -1,0 +1,9 @@
+build/
+platforms/
+lnInclude/
+*.o
+*.dep
+*.so
+*.a
+docs/site/
+.DS_Store

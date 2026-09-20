@@ -1,0 +1,6 @@
+#!/bin/bash
+# Clean openfoam-amgx build artefacts.
+
+cd "$(dirname "$0")" || exit 1
+
+wclean src/nvidiaSolvers

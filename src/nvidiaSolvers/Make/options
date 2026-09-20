@@ -1,0 +1,20 @@
+EXE_INC = \
+    -DOMPI_SKIP_MPICXX \
+    -I$(LIB_SRC)/finiteVolume/lnInclude \
+    -I$(LIB_SRC)/meshTools/lnInclude \
+    -I$(LIB_SRC)/Pstream/mpi/lnInclude \
+    $(addprefix -I,$(shell mpicc --showme:incdirs)) \
+    -I$(AMGX_DIR)/include \
+    -I$(CUDA_HOME)/include
+
+LIB_LIBS = \
+    -L$(AMGX_DIR)/lib \
+    -L$(CUDA_HOME)/lib64 \
+    -Wl,-rpath,$(AMGX_DIR)/lib \
+    -Wl,-rpath,$(CUDA_HOME)/lib64 \
+    -lamgxsh \
+    -lcusparse \
+    -lcublas \
+    -lcusolver \
+    -lcudart \
+    -lOpenFOAM

@@ -1,0 +1,21 @@
+#!/bin/bash
+# Build openfoam-amgx
+# Run after sourcing your OpenFOAM environment.
+
+set -e
+
+cd "$(dirname "$0")" || exit 1
+
+if [ -z "$WM_PROJECT" ]; then
+    echo "OpenFOAM environment not sourced (WM_PROJECT is empty)."
+    echo "Run: source /path/to/OpenFOAM/etc/bashrc"
+    exit 1
+fi
+
+if [ -z "$AMGX_DIR" ]; then
+    echo "AMGX_DIR is not set. Point it at your AmgX installation."
+    echo "Run: export AMGX_DIR=/path/to/amgx"
+    exit 1
+fi
+
+wmake libso src/nvidiaSolvers

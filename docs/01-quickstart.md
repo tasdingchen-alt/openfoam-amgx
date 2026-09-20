@@ -1,0 +1,162 @@
+# Quick start
+
+## 1. Build AmgX
+
+See `02-build-amgx.md`. You should end up with:
+
+```
+$AMGX_DIR/include/amgx_c.h
+$AMGX_DIR/lib/libamgx.so
+```
+
+## 2. Build openfoam-amgx
+
+```bash
+source /path/to/OpenFOAM/etc/bashrc
+export AMGX_DIR=/path/to/amgx
+export CUDA_HOME=/usr/local/cuda
+
+cd openfoam-amgx
+./Allwmake
+```
+
+The library is installed to `$FOAM_USER_LIBBIN/libnvidiaSolvers.so`.
+
+## 3. Use it
+
+In `system/controlDict`:
+
+```foam
+libs ("libnvidiaSolvers.so");
+```
+
+In `system/fvSolution`:
+
+```foam
+solvers
+{
+    p
+    {
+        solver      AmgX;
+
+        AmgX
+        {
+            configFile  "amgx_config.json";
+            mode        dDDI;
+            verbose     false;
+
+            // Rebuild the AMG hierarchy every solve (safe default).
+            // Set to false to reuse the hierarchy across solves - faster
+            // when the matrix coefficients change slowly, but the
+            // preconditioner may degrade if they change a lot.
+            setupEveryTime true;
+        }
+
+        tolerance   1e-8;
+        relTol      0.01;
+    }
+
+    "(U|k|epsilon)"
+    {
+        solver      AmgX;
+
+        AmgX
+        {
+            mode    dDDI;
+        }
+
+        tolerance   1e-8;
+        relTol      0.1;
+    }
+}
+```
+
+Copy `examples/amgx_config.json` next to your case, or omit `configFile`
+to let the solver generate a default configuration from `tolerance`,
+`relTol` and `maxIter`.
+
+## AmgX options
+
+All options go in the `AmgX` sub-dictionary. `configFile`, if given, overrides
+all of the generated configuration below.
+
+| Option            | Default         | Notes                                            |
+|-------------------|-----------------|--------------------------------------------------|
+| `configFile`      | none            | JSON/legacy AmgX config file                     |
+| `mode`            | `dDDI`          | `dDDI`, `dDFI`, `dFFI`, `hDDI`, `hDFI`, `hFFI`   |
+| `verbose`         | `false`         | Print AmgX solve stats                           |
+| `setupEveryTime`  | `true`          | Rebuild the AMG hierarchy every solve            |
+| `solver`          | `FGMRES`        | `FGMRES`, `GMRES`, `PCG`, `PBICGSTAB`, `AMG`     |
+| `algorithm`       | `AGGREGATION`   | `AGGREGATION`, `CLASSICAL`                       |
+| `smoother`        | `BLOCK_JACOBI`  | e.g. `MULTICOLOR_DILU`, `MULTICOLOR_GS`          |
+| `coarseSolver`    | `NOSOLVER`      | `NOSOLVER`, `DENSE_LU_SOLVER`                    |
+| `interpolator`    | `D2`            | CLASSICAL only; `D1` is not distributed-safe     |
+| `selector`        | `SIZE_2`        | Aggregation selector                             |
+| `maxLevels`       | `50`            | Maximum number of AMG levels                     |
+
+The generated `tolerance` is `relTol` when it is non-zero, otherwise the
+absolute `tolerance`. AmgX convergence is relative to the initial residual;
+OpenFOAM's normalised initial residual is O(1), so the two are close.
+
+## Parallel (MPI)
+
+AmgX is used in MPI mode. The OpenFOAM cells are numbered rank-contiguously
+and processor couplings are passed to AmgX as halo entries with global column
+indices (`AMGX_matrix_upload_all_global_32`), so no manual communication maps
+are needed.
+
+```bash
+source /path/to/OpenFOAM/etc/bashrc
+unset FOAM_SIGFPE
+
+decomposePar
+mpirun -np 4 foamRun -parallel
+```
+
+Each rank is assigned one GPU: rank `r` uses device `r % numDevices`. On a
+single-GPU machine all ranks share device 0 (correct but slower than serial
+for small cases).
+
+Requirements:
+
+- AmgX must be built with the **same MPI** as OpenFOAM. The default
+  `find_package(MPI)` build matches a system OpenMPI.
+- The build needs the MPI headers; `Make/options` obtains them with
+  `$(shell mpicc --showme:incdirs)` and includes `Pstream/mpi/lnInclude`.
+
+## Notes
+
+- **`unset FOAM_SIGFPE` is required.** OpenFOAM v12's `etc/bashrc` defines
+  `export FOAM_SIGFPE=` (empty but set) and `Foam::env()` only checks whether a
+  variable exists, so floating-point trapping is enabled. AmgX performs benign
+  floating-point operations that then raise SIGFPE and abort the run. Before
+  running, do:
+
+  ```bash
+  source /path/to/OpenFOAM/etc/bashrc
+  unset FOAM_SIGFPE
+  ```
+
+- `mode` selects the AmgX data/index precision. `dDDI` is double/double/int32.
+  Valid values: `dDDI`, `dDFI`, `dFFI`, `hDDI`, `hDFI`, `hFFI`. There are no
+  `sDDI`/`sDFI`/`sFFI` modes (single precision is `dFFI`/`hFFI`).
+- OpenFOAM labels are converted to `int32` for AmgX. Meshes larger than
+  ~2.1e9 non-zeros are not supported in `dDDI`.
+- The initial and final residuals reported in the log are computed on the
+  CPU and normalised exactly like the built-in OpenFOAM solvers.
+- AmgX is given `-A` and `-b` when the diagonal is negative (OpenFOAM's
+  pressure matrix is negative definite). This is an equivalent system and
+  keeps the diagonal positive, which AmgX's aggregation AMG requires.
+
+## AmgX configuration quirks
+
+The default configuration generated by the solver follows the layout of
+AmgX's own `FGMRES_AGGREGATION_JACOBI.json`. Two AmgX parser quirks are worth
+knowing:
+
+- The `"preconditioner"` entry must come **first** in the `"solver"` object,
+  and the outer solver needs `"scope": "main"` while the preconditioner needs
+  `"scope": "amg"`.
+- `"monitor_residual": 0` makes `AMGX_solver_create` fail with
+  `AMGX_RC_BAD_PARAMETERS`. Use `1`.
+
