@@ -342,16 +342,6 @@ void Foam::AmgXSolver::buildHalos
     List<ldu2csr::Entry>& halos
 ) const
 {
-    const label nCells = matrix_.diag().size();
-
-    // Field of global cell indices. Stored as scalars so that the existing
-    // interface matrix-update machinery can be reused to exchange them.
-    scalarField g(nCells);
-    for (label i = 0; i < nCells; i++)
-    {
-        g[i] = scalar(rowStart + i);
-    }
-
     forAll(interfaces_, i)
     {
         if (!interfaces_.set(i))
@@ -362,7 +352,10 @@ void Foam::AmgXSolver::buildHalos
         const lduInterface& intf = interfaces_[i].interface();
 
         // Only processor interfaces are supported for now
-        if (!dynamic_cast<const processorLduInterface*>(&intf))
+        const processorLduInterface* pi =
+            dynamic_cast<const processorLduInterface*>(&intf);
+
+        if (!pi)
         {
             continue;
         }
@@ -370,39 +363,49 @@ void Foam::AmgXSolver::buildHalos
         const labelUList& fc = intf.faceCells();
         const scalarField& bou = interfaceBouCoeffs_[i];
 
-        scalarField result(nCells, 0.0);
-        const scalarField ones(fc.size(), 1.0);
+        labelField myG(fc.size());
+        forAll(fc, j)
+        {
+            myG[j] = rowStart + fc[j];
+        }
 
-        interfaces_[i].initInterfaceMatrixUpdate
-        (
-            result,
-            g,
-            ones,
-            0,
-            Pstream::defaultCommsType
-        );
+        labelField nbrG(fc.size(), 0);
 
-        interfaces_[i].updateInterfaceMatrix
-        (
-            result,
-            g,
-            ones,
-            0,
-            Pstream::defaultCommsType
-        );
+        if (pi->myProcNo() < pi->neighbProcNo())
+        {
+            pi->send(Pstream::commsTypes::blocking, myG);
+            pi->receive(Pstream::commsTypes::blocking, nbrG);
+        }
+        else
+        {
+            pi->receive(Pstream::commsTypes::blocking, nbrG);
+            pi->send(Pstream::commsTypes::blocking, myG);
+        }
 
         forAll(fc, j)
         {
             ldu2csr::Entry e;
             e.row = fc[j];
-
-            // updateInterfaceMatrix does result -= coeffs*recv, so negate
-            e.col = label(-result[fc[j]] + 0.5);
-
-            // Amul adds -bou * psiNeighbour, so A(row, col) = -bou
+            e.col = nbrG[j];
             e.value = -bou[j];
             halos.append(e);
         }
+    }
+
+    if (::getenv("AMGX_DEBUG_HALO"))
+    {
+        label minC = labelMax;
+        label maxC = -labelMax;
+        forAll(halos, k)
+        {
+            minC = min(minC, halos[k].col);
+            maxC = max(maxC, halos[k].col);
+        }
+        Pout<< "rank " << Pstream::myProcNo()
+            << " rowStart=" << rowStart
+            << " nHalos=" << halos.size()
+            << " colMin=" << minC
+            << " colMax=" << maxC << endl;
     }
 }
 
@@ -439,6 +442,14 @@ Foam::solverPerformance Foam::AmgXSolver::solve
                 rowStart += nCellsPerProc[p];
             }
             nGlobal += nCellsPerProc[p];
+        }
+
+        if (::getenv("AMGX_DEBUG_PAR"))
+        {
+            Pout<< "rank " << Pstream::myProcNo() << "/" << Pstream::nProcs()
+                << " nCells=" << nCells << " nGlobal=" << nGlobal
+                << " rowStart=" << rowStart
+                << " sumLocal=" << sum(nCellsPerProc) << endl;
         }
     }
 
