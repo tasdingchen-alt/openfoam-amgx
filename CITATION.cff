@@ -6,7 +6,7 @@ abstract: >-
   linear solves to NVIDIA GPUs using AmgX, with serial and MPI parallel support.
 authors:
   - name: "openfoam-amgx contributors"
-version: 0.1.0
+version: 0.2.0
 license: GPL-3.0-or-later
 keywords:
   - OpenFOAM

@@ -25,18 +25,17 @@ License
 
 #include "ldu2csr.H"
 
-#include <vector>
 #include <algorithm>
-#include <utility>
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-void Foam::ldu2csr::assemble
+void Foam::ldu2csr::gather
 (
     const lduMatrix& matrix,
     const label rowStart,
-    const List<Entry>& extra
-)
+    const List<Entry>& extra,
+    std::vector<Row>& rows
+) const
 {
     const label nCells = matrix.diag().size();
     const label nFaces = matrix.upper().size();
@@ -48,71 +47,76 @@ void Foam::ldu2csr::assemble
     const scalarField& upper = matrix.upper();
     const scalarField& lower = matrix.lower();
 
-    // Collect (column, value) entries per row
-    std::vector<std::vector<std::pair<label, scalar>>> rows(nCells);
+    rows.resize(nCells);
 
+    // Diagonal entries
     for (label cell = 0; cell < nCells; cell++)
     {
         rows[cell].push_back(std::make_pair(rowStart + cell, diag[cell]));
     }
 
-    for (label f = 0; f < nFaces; f++)
+    // Off-diagonal entries of the internal faces
+    for (label face = 0; face < nFaces; face++)
     {
-        const label o = owner[f];
-        const label n = neighbour[f];
-
-        // A(owner, neighbour) = lower
-        rows[o].push_back(std::make_pair(rowStart + n, lower[f]));
-
-        // A(neighbour, owner) = upper
-        rows[n].push_back(std::make_pair(rowStart + o, upper[f]));
+        rows[owner[face]].push_back
+        (
+            std::make_pair(rowStart + neighbour[face], lower[face])
+        );
+        rows[neighbour[face]].push_back
+        (
+            std::make_pair(rowStart + owner[face], upper[face])
+        );
     }
 
-    // Off-processor (halo) entries, already with global column indices
+    // Extra (halo) entries already carry global column indices
     forAll(extra, i)
     {
         const Entry& e = extra[i];
         rows[e.row].push_back(std::make_pair(e.col, e.value));
     }
+}
 
-    // Sort columns and merge duplicates, then count non-zeros
-    nRows_ = nCells;
+
+void Foam::ldu2csr::flatten(std::vector<Row>& rows)
+{
+    nRows_ = rows.size();
     nNonZeros_ = 0;
 
-    for (label cell = 0; cell < nCells; cell++)
+    for (label cell = 0; cell < nRows_; cell++)
     {
-        std::vector<std::pair<label, scalar>>& r = rows[cell];
+        Row& row = rows[cell];
 
         std::sort
         (
-            r.begin(),
-            r.end(),
+            row.begin(),
+            row.end(),
             [](const std::pair<label, scalar>& a, const std::pair<label, scalar>& b)
             {
                 return a.first < b.first;
             }
         );
 
-        std::vector<std::pair<label, scalar>> merged;
-        merged.reserve(r.size());
+        // Merge duplicates that point at the same column
+        Row merged;
+        merged.reserve(row.size());
 
-        for (const std::pair<label, scalar>& e : r)
+        for (const std::pair<label, scalar>& entry : row)
         {
-            if (!merged.empty() && merged.back().first == e.first)
+            if (!merged.empty() && merged.back().first == entry.first)
             {
-                merged.back().second += e.second;
+                merged.back().second += entry.second;
             }
             else
             {
-                merged.push_back(e);
+                merged.push_back(entry);
             }
         }
 
-        rows[cell].swap(merged);
-        nNonZeros_ += label(rows[cell].size());
+        row.swap(merged);
+        nNonZeros_ += row.size();
     }
 
-    // Flatten
+    // Pack the rows into the CSR arrays
     rowPtr_.setSize(nRows_ + 1);
     colInd_.setSize(nNonZeros_);
     values_.setSize(nNonZeros_);
@@ -120,12 +124,12 @@ void Foam::ldu2csr::assemble
     label idx = 0;
     rowPtr_[0] = 0;
 
-    for (label cell = 0; cell < nCells; cell++)
+    for (label cell = 0; cell < nRows_; cell++)
     {
-        for (const std::pair<label, scalar>& e : rows[cell])
+        for (const std::pair<label, scalar>& entry : rows[cell])
         {
-            colInd_[idx] = e.first;
-            values_[idx] = e.second;
+            colInd_[idx] = entry.first;
+            values_[idx] = entry.second;
             idx++;
         }
 
@@ -134,7 +138,7 @@ void Foam::ldu2csr::assemble
 }
 
 
-// * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
+// * * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * //
 
 Foam::ldu2csr::ldu2csr(const lduMatrix& matrix)
 :
@@ -144,7 +148,9 @@ Foam::ldu2csr::ldu2csr(const lduMatrix& matrix)
     colInd_(),
     values_()
 {
-    assemble(matrix, 0, List<Entry>());
+    std::vector<Row> rows;
+    gather(matrix, 0, List<Entry>(), rows);
+    flatten(rows);
 }
 
 
@@ -161,15 +167,19 @@ Foam::ldu2csr::ldu2csr
     colInd_(),
     values_()
 {
-    assemble(matrix, rowStart, extra);
+    std::vector<Row> rows;
+    gather(matrix, rowStart, extra, rows);
+    flatten(rows);
 }
 
 
-// * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
+// * * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * //
 
 void Foam::ldu2csr::updateValues(const lduMatrix& matrix)
 {
-    assemble(matrix, 0, List<Entry>());
+    std::vector<Row> rows;
+    gather(matrix, 0, List<Entry>(), rows);
+    flatten(rows);
 }
 
 

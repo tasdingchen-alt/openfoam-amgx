@@ -98,7 +98,6 @@ public:
         //- Structure of the cached matrix
         label nCells;
         label nGlobal;
-        label nnz;
 
         //- Parallel (MPI) build?
         bool parallel;
@@ -183,6 +182,55 @@ private:
 
         //- Return the process-wide cached state for a key
         static State& cachedState(const std::string& key);
+
+        //- Compute the rank-contiguous global row offset (rowStart) and the
+        //  global row count (nGlobal) for the parallel numbering scheme
+        void globalRange
+        (
+            const label nCells,
+            label& rowStart,
+            label& nGlobal
+        ) const;
+
+        //- Cache key: the AmgX configuration (tolerance, max_iters) is baked
+        //  into the solver at creation, so the controls are part of the key
+        std::string stateKey() const;
+
+        //- Assemble the CSR matrix. In parallel the halo entries are rebuilt
+        //  on every call so their coefficients stay up to date
+        void assembleCsr
+        (
+            State& st,
+            const label rowStart,
+            const label nCells,
+            const label nFaces
+        ) const;
+
+        //- Solve (-A, -b) instead of (A, b) when the diagonal is negative
+        //  (OpenFOAM's pressure matrix is negative definite). AmgX's
+        //  aggregation AMG assumes a positive diagonal. Returns true when
+        //  the sign was flipped
+        bool normaliseSign(State& st) const;
+
+        //- OpenFOAM-normalised residual of (A psi - source)
+        scalar normalisedResidual
+        (
+            const scalarField& psi,
+            const scalarField& source,
+            const direction cmpt
+        ) const;
+
+        //- Upload the matrix pattern or replace the coefficients
+        void uploadMatrix(State& st) const;
+
+        //- Upload the RHS and the initial guess, solve, download the result
+        //  and return the iteration count
+        label solveAmgX
+        (
+            State& st,
+            scalarField& psi,
+            const scalarField& rhs
+        ) const;
 
 
 public:

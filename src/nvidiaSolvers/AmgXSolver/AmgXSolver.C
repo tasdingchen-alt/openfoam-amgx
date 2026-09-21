@@ -76,7 +76,6 @@ Foam::AmgXSolver::State::State()
     csr(),
     nCells(0),
     nGlobal(0),
-    nnz(0),
     parallel(false),
     initialised(false),
     patternSet(false),
@@ -258,7 +257,10 @@ void Foam::AmgXSolver::initialise(State& st) const
 
     if (!configFile_.empty())
     {
-        AMGX_CHECK_CALL(AMGX_config_create_from_file(&st.cfg, configFile_.c_str()));
+        AMGX_CHECK_CALL
+        (
+            AMGX_config_create_from_file(&st.cfg, configFile_.c_str())
+        );
     }
     else
     {
@@ -363,12 +365,14 @@ void Foam::AmgXSolver::buildHalos
         const labelUList& fc = intf.faceCells();
         const scalarField& bou = interfaceBouCoeffs_[i];
 
+        // Global row index of the local cells on this interface
         labelField myG(fc.size());
         forAll(fc, j)
         {
             myG[j] = rowStart + fc[j];
         }
 
+        // The matching global row indices on the neighbour process
         labelField nbrG(fc.size(), 0);
 
         if (pi->myProcNo() < pi->neighbProcNo())
@@ -382,6 +386,7 @@ void Foam::AmgXSolver::buildHalos
             pi->send(Pstream::commsTypes::blocking, myG);
         }
 
+        // Halo entry: local row, global column, coupling coefficient
         forAll(fc, j)
         {
             ldu2csr::Entry e;
@@ -410,85 +415,73 @@ void Foam::AmgXSolver::buildHalos
 }
 
 
-Foam::solverPerformance Foam::AmgXSolver::solve
+void Foam::AmgXSolver::globalRange
 (
-    scalarField& psi,
-    const scalarField& source,
-    const direction cmpt
+    const label nCells,
+    label& rowStart,
+    label& nGlobal
 ) const
 {
-    solverPerformance solverPerf(typeName, fieldName_);
+    // Cells are numbered rank-contiguously: this rank owns the rows
+    // [rowStart, rowStart + nCells) of the global matrix
+    rowStart = 0;
+    nGlobal = nCells;
 
-    const label nCells = psi.size();
-    const label nFaces = matrix_.upper().size();
-    const bool parRun = Pstream::parRun();
-
-    // Rank-contiguous global cell numbering
-    label rowStart = 0;
-    label nGlobal = nCells;
-
-    if (parRun)
+    if (!Pstream::parRun())
     {
-        labelList nCellsPerProc(Pstream::nProcs(), 0);
-        nCellsPerProc[Pstream::myProcNo()] = nCells;
-        Pstream::gatherList(nCellsPerProc);
-        Pstream::scatterList(nCellsPerProc);
+        return;
+    }
 
-        nGlobal = 0;
-        forAll(nCellsPerProc, p)
+    labelList nCellsPerProc(Pstream::nProcs(), 0);
+    nCellsPerProc[Pstream::myProcNo()] = nCells;
+    Pstream::gatherList(nCellsPerProc);
+    Pstream::scatterList(nCellsPerProc);
+
+    nGlobal = 0;
+    forAll(nCellsPerProc, proc)
+    {
+        if (proc < Pstream::myProcNo())
         {
-            if (p < Pstream::myProcNo())
-            {
-                rowStart += nCellsPerProc[p];
-            }
-            nGlobal += nCellsPerProc[p];
+            rowStart += nCellsPerProc[proc];
         }
-
-        if (::getenv("AMGX_DEBUG_PAR"))
-        {
-            Pout<< "rank " << Pstream::myProcNo() << "/" << Pstream::nProcs()
-                << " nCells=" << nCells << " nGlobal=" << nGlobal
-                << " rowStart=" << rowStart
-                << " sumLocal=" << sum(nCellsPerProc) << endl;
-        }
+        nGlobal += nCellsPerProc[proc];
     }
 
-    // Process-wide cache keyed by field name, mesh and solver controls.
-    // The controls are part of the key because the AmgX configuration
-    // (tolerance, max_iters) is baked into the solver at creation.
-    std::ostringstream keyOs;
-    keyOs << fieldName_ << ':' << static_cast<const void*>(&matrix_.mesh())
-          << ':' << relTol_ << ':' << tolerance_ << ':' << maxIter_
-          << ':' << int(parRun);
-    State& st = cachedState(keyOs.str());
-
-    // Recreate the AmgX objects if the matrix structure changed
-    if
-    (
-        st.initialised
-     && (st.nCells != nCells || st.nGlobal != nGlobal || st.parallel != parRun)
-    )
+    if (::getenv("AMGX_DEBUG_PAR"))
     {
-        shutdown(st);
-        st.csr.clear();
-        st.patternSet = false;
-        st.needSetup = true;
+        Pout<< "rank " << Pstream::myProcNo() << "/" << Pstream::nProcs()
+            << " nCells=" << nCells << " nGlobal=" << nGlobal
+            << " rowStart=" << rowStart
+            << " sumLocal=" << sum(nCellsPerProc) << endl;
     }
+}
 
-    if (!st.initialised)
-    {
-        initialise(st);
-        st.nCells = nCells;
-        st.nGlobal = nGlobal;
-        st.parallel = parRun;
-    }
 
-    // --- Assemble the CSR matrix ---
-    if (parRun)
+std::string Foam::AmgXSolver::stateKey() const
+{
+    std::ostringstream key;
+
+    key << fieldName_ << ':' << static_cast<const void*>(&matrix_.mesh())
+        << ':' << relTol_ << ':' << tolerance_ << ':' << maxIter_
+        << ':' << int(Pstream::parRun());
+
+    return key.str();
+}
+
+
+void Foam::AmgXSolver::assembleCsr
+(
+    State& st,
+    const label rowStart,
+    const label nCells,
+    const label nFaces
+) const
+{
+    if (Pstream::parRun())
     {
-        // The halo pattern is fixed for a given mesh, so the matrix pattern
-        // only changes when the structure changes (handled above). The CSR is
-        // rebuilt each solve to refresh the halo coefficients.
+        // IMPORTANT: the halo coefficients change between solves, so the
+        // halo entries are rebuilt on every call. Caching them (e.g. for
+        // performance) makes AmgX solve a stale matrix and stalls FGMRES.
         List<ldu2csr::Entry> halos;
         buildHalos(rowStart, halos);
 
@@ -509,46 +502,60 @@ Foam::solverPerformance Foam::AmgXSolver::solve
     {
         st.csr->updateValues(matrix_);
     }
+}
 
-    const label nnz = st.csr->nNonZeros();
 
-    // --- Normalise the sign so the diagonal is positive for AmgX's AMG ---
-    // OpenFOAM's pressure matrix is negative definite; AmgX's aggregation
-    // AMG assumes a positive diagonal. Solving (-A) x = (-b) is equivalent.
+bool Foam::AmgXSolver::normaliseSign(State& st) const
+{
     const scalar sign = (matrix_.diag()[0] < 0.0) ? -1.0 : 1.0;
 
-    if (sign < 0.0)
+    if (sign > 0.0)
     {
-        scalar* vals = st.csr->values();
-
-        for (label i = 0; i < nnz; i++)
-        {
-            vals[i] = -vals[i];
-        }
+        return false;
     }
 
-    // --- Initial residual, OpenFOAM-normalised ---
+    scalar* vals = st.csr->values();
+
+    for (label i = 0; i < st.csr->nNonZeros(); i++)
     {
-        scalarField Apsi(nCells);
-        matrix_.Amul(Apsi, psi, interfaceBouCoeffs_, interfaces_, cmpt);
-
-        const scalarField rA(source - Apsi);
-        scalarField tmp(nCells);
-
-        const scalar nf = this->normFactor(psi, source, Apsi, tmp);
-
-        solverPerf.initialResidual() =
-            gSumMag(rA, matrix_.mesh().comm())/nf;
-        solverPerf.finalResidual() = solverPerf.initialResidual();
+        vals[i] = -vals[i];
     }
 
-    // --- Upload the matrix ---
+    return true;
+}
+
+
+Foam::scalar Foam::AmgXSolver::normalisedResidual
+(
+    const scalarField& psi,
+    const scalarField& source,
+    const direction cmpt
+) const
+{
+    scalarField Apsi(psi.size());
+    matrix_.Amul(Apsi, psi, interfaceBouCoeffs_, interfaces_, cmpt);
+
+    const scalarField rA(source - Apsi);
+    scalarField tmp(psi.size());
+
+    const scalar nf = this->normFactor(psi, source, Apsi, tmp);
+
+    return gSumMag(rA, matrix_.mesh().comm())/nf;
+}
+
+
+void Foam::AmgXSolver::uploadMatrix(State& st) const
+{
+    const label nRows = st.csr->nRows();
+    const label nnz = st.csr->nNonZeros();
+
     if (!st.patternSet)
     {
-        std::vector<int> rowPtr(st.csr->nRows() + 1);
+        // AmgX dDDI uses int32 indices
+        std::vector<int> rowPtr(nRows + 1);
         std::vector<int> colInd(nnz);
 
-        for (label i = 0; i <= st.csr->nRows(); i++)
+        for (label i = 0; i <= nRows; i++)
         {
             rowPtr[i] = int(st.csr->rowPtr()[i]);
         }
@@ -558,8 +565,10 @@ Foam::solverPerformance Foam::AmgXSolver::solve
             colInd[i] = int(st.csr->colInd()[i]);
         }
 
-        if (parRun)
+        if (st.parallel)
         {
+            // Distributed upload with rank-contiguous global numbering:
+            // off-processor columns are halo entries with global indices
             int nrings = 1;
             AMGX_CHECK_CALL
             (
@@ -571,8 +580,8 @@ Foam::solverPerformance Foam::AmgXSolver::solve
                 AMGX_matrix_upload_all_global_32
                 (
                     st.mat,
-                    int(nGlobal),
-                    int(nCells),
+                    int(st.nGlobal),
+                    int(st.nCells),
                     int(nnz),
                     1,
                     1,
@@ -596,7 +605,7 @@ Foam::solverPerformance Foam::AmgXSolver::solve
                 AMGX_matrix_upload_all
                 (
                     st.mat,
-                    int(nCells),
+                    int(st.nCells),
                     int(nnz),
                     1,
                     1,
@@ -618,13 +627,100 @@ Foam::solverPerformance Foam::AmgXSolver::solve
             AMGX_matrix_replace_coefficients
             (
                 st.mat,
-                int(nCells),
+                int(st.nCells),
                 int(nnz),
                 st.csr->values(),
                 nullptr
             )
         );
     }
+}
+
+
+Foam::label Foam::AmgXSolver::solveAmgX
+(
+    State& st,
+    scalarField& psi,
+    const scalarField& rhs
+) const
+{
+    // x holds psi as the initial guess
+    AMGX_CHECK_CALL(AMGX_vector_upload(st.b, st.nCells, 1, rhs.begin()));
+    AMGX_CHECK_CALL(AMGX_vector_upload(st.x, st.nCells, 1, psi.begin()));
+
+    AMGX_CHECK_CALL(AMGX_solver_solve(st.solver, st.b, st.x));
+    AMGX_CHECK_CALL(AMGX_vector_download(st.x, psi.begin()));
+
+    label iters = 0;
+    AMGX_CHECK_CALL(AMGX_solver_get_iterations_number(st.solver, &iters));
+
+    if (verbose_)
+    {
+        AMGX_SOLVE_STATUS status;
+        AMGX_CHECK_CALL(AMGX_solver_get_status(st.solver, &status));
+
+        Info<< "    AmgX status=" << int(status)
+            << " iterations=" << iters << endl;
+    }
+
+    return iters;
+}
+
+
+Foam::solverPerformance Foam::AmgXSolver::solve
+(
+    scalarField& psi,
+    const scalarField& source,
+    const direction cmpt
+) const
+{
+    solverPerformance solverPerf(typeName, fieldName_);
+
+    const label nCells = psi.size();
+    const label nFaces = matrix_.upper().size();
+
+    // --- Rank-contiguous global cell numbering (parallel) ---
+    label rowStart = 0;
+    label nGlobal = nCells;
+    globalRange(nCells, rowStart, nGlobal);
+
+    // --- Process-wide cached AmgX state ---
+    State& st = cachedState(stateKey());
+
+    // Recreate the AmgX objects if the matrix structure changed
+    if
+    (
+        st.initialised
+     && (st.nCells != nCells || st.nGlobal != nGlobal
+         || st.parallel != Pstream::parRun())
+    )
+    {
+        shutdown(st);
+        st.csr.clear();
+        st.patternSet = false;
+        st.needSetup = true;
+    }
+
+    if (!st.initialised)
+    {
+        initialise(st);
+        st.nCells = nCells;
+        st.nGlobal = nGlobal;
+        st.parallel = Pstream::parRun();
+    }
+
+    // --- CSR assembly ---
+    assembleCsr(st, rowStart, nCells, nFaces);
+
+    // --- Sign normalisation: solve (-A) x = (-b) for a negative diagonal ---
+    const bool signFlipped = normaliseSign(st);
+
+    // --- Initial residual, OpenFOAM-normalised ---
+    solverPerf.initialResidual() = normalisedResidual(psi, source, cmpt);
+    solverPerf.finalResidual() = solverPerf.initialResidual();
+
+    // --- Matrix upload / coefficient update ---
+    uploadMatrix(st);
 
     // --- (Re)build the AMG hierarchy when required ---
     if (st.needSetup || setupEveryTime_)
@@ -633,36 +729,19 @@ Foam::solverPerformance Foam::AmgXSolver::solve
         st.needSetup = false;
     }
 
-    // --- Upload vectors (RHS negated to match the sign normalisation) ---
+    // --- RHS, negated to match the sign normalisation ---
     scalarField rhs(source);
 
-    if (sign < 0.0)
+    if (signFlipped)
     {
-        forAll(rhs, i)
-        {
-            rhs[i] = -rhs[i];
-        }
+        rhs = -rhs;
     }
 
-    AMGX_CHECK_CALL(AMGX_vector_upload(st.b, nCells, 1, rhs.begin()));
-    AMGX_CHECK_CALL(AMGX_vector_upload(st.x, nCells, 1, psi.begin()));
-
-    // --- Solve (x_ holds psi as the initial guess) ---
-    AMGX_CHECK_CALL(AMGX_solver_solve(st.solver, st.b, st.x));
-    AMGX_CHECK_CALL(AMGX_vector_download(st.x, psi.begin()));
+    // --- Upload vectors, solve, download ---
+    solverPerf.nIterations() = solveAmgX(st, psi, rhs);
 
     AMGX_SOLVE_STATUS status;
     AMGX_CHECK_CALL(AMGX_solver_get_status(st.solver, &status));
-
-    int iters = 0;
-    AMGX_CHECK_CALL(AMGX_solver_get_iterations_number(st.solver, &iters));
-    solverPerf.nIterations() = iters;
-
-    if (verbose_)
-    {
-        Info<< "    AmgX status=" << int(status)
-            << " iterations=" << iters << endl;
-    }
 
     // Rebuild the hierarchy next time if this solve did not converge
     if (status != AMGX_SOLVE_SUCCESS)
@@ -671,18 +750,7 @@ Foam::solverPerformance Foam::AmgXSolver::solve
     }
 
     // --- Final residual, OpenFOAM-normalised ---
-    {
-        scalarField Apsi(nCells);
-        matrix_.Amul(Apsi, psi, interfaceBouCoeffs_, interfaces_, cmpt);
-
-        const scalarField rA(source - Apsi);
-        scalarField tmp(nCells);
-
-        const scalar nf = this->normFactor(psi, source, Apsi, tmp);
-
-        solverPerf.finalResidual() =
-            gSumMag(rA, matrix_.mesh().comm())/nf;
-    }
+    solverPerf.finalResidual() = normalisedResidual(psi, source, cmpt);
 
     solverPerf.checkConvergence(tolerance_, relTol_);
 

@@ -41,6 +41,13 @@ Description
     In parallel, columns are global cell indices (local row offset = rowStart)
     and off-processor couplings are supplied as additional halo entries.
 
+    Assembly happens in two phases:
+
+        gather   - collect (column, value) pairs per row, including the halo
+                   entries;
+        flatten  - sort each row by column, merge duplicates and pack the
+                   result into the CSR arrays.
+
 SourceFiles
     ldu2csr.C
 
@@ -50,6 +57,9 @@ SourceFiles
 #define ldu2csr_H
 
 #include "lduMatrix.H"
+
+#include <utility>
+#include <vector>
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -95,13 +105,22 @@ private:
 
     // Private Member Functions
 
-        //- Assemble the CSR structure and values from the matrix
-        void assemble
+        //- A single row while it is being assembled
+        typedef std::vector<std::pair<label, scalar>> Row;
+
+        //- Gather (column, value) pairs per row from the lduMatrix and the
+        //  extra (halo) entries
+        void gather
         (
             const lduMatrix& matrix,
             const label rowStart,
-            const List<Entry>& extra
-        );
+            const List<Entry>& extra,
+            std::vector<Row>& rows
+        ) const;
+
+        //- Sort each row by column, merge duplicates and pack into the CSR
+        //  arrays
+        void flatten(std::vector<Row>& rows);
 
 
 public:
