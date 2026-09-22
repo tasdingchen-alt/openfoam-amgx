@@ -1,4 +1,5 @@
 EXE_INC = \
+    -fopenmp \
     -DOMPI_SKIP_MPICXX \
     -I$(LIB_SRC)/finiteVolume/lnInclude \
     -I$(LIB_SRC)/meshTools/lnInclude \
@@ -17,4 +18,5 @@ LIB_LIBS = \
     -lcublas \
     -lcusolver \
     -lcudart \
-    -lOpenFOAM
+    -lOpenFOAM \
+    -fopenmp

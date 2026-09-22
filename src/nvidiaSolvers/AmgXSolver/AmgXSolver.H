@@ -158,6 +158,9 @@ private:
         //- Maximum number of AMG levels
         label maxLevels_;
 
+        //- FGMRES restart length (Krylov workspace size)
+        label gmresRestart_;
+
 
     // Private Member Functions
 

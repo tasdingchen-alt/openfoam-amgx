@@ -14,9 +14,9 @@ License
     option) any later version.
 
     openfoam-amgx is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
-    or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
-    for more details.
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+    Public License for more details.
 
     You should have received a copy of the GNU General Public License along
     with openfoam-amgx.  If not, see <https://www.gnu.org/licenses/>.
@@ -41,12 +41,11 @@ Description
     In parallel, columns are global cell indices (local row offset = rowStart)
     and off-processor couplings are supplied as additional halo entries.
 
-    Assembly happens in two phases:
-
-        gather   - collect (column, value) pairs per row, including the halo
-                   entries;
-        flatten  - sort each row by column, merge duplicates and pack the
-                   result into the CSR arrays.
+    The sparsity structure (rowPtr, colInd) of an lduMatrix depends only on
+    the mesh, so it is built once and cached together with a map from each
+    CSR entry back to its source (diagonal / lower / upper / halo). Subsequent
+    solves then only refresh the values array, in parallel, without any heap
+    allocation or per-row sorting.
 
 SourceFiles
     ldu2csr.C
@@ -102,14 +101,31 @@ private:
         //- CSR values (size nNonZeros_)
         scalarField values_;
 
+        //- Source array of each CSR value: 0=diag, 1=lower, 2=upper, 3=halo
+        labelList srcType_;
+
+        //- Index into the source array for each CSR value
+        labelList srcIndex_;
+
+        //- Is the cached structure usable for fast value updates?
+        bool cacheable_;
+
 
     // Private Member Functions
 
-        //- A single row while it is being assembled
-        typedef std::vector<std::pair<label, scalar>> Row;
+        //- A single entry while a row is being assembled
+        struct Item
+        {
+            label col;
+            scalar val;
+            label src;
+            label idx;
+        };
 
-        //- Gather (column, value) pairs per row from the lduMatrix and the
-        //  extra (halo) entries
+        typedef std::vector<Item> Row;
+
+        //- Gather (column, value, source) triples per row from the lduMatrix
+        //  and the extra (halo) entries
         void gather
         (
             const lduMatrix& matrix,
@@ -119,7 +135,7 @@ private:
         ) const;
 
         //- Sort each row by column, merge duplicates and pack into the CSR
-        //  arrays
+        //  arrays, recording the source map
         void flatten(std::vector<Row>& rows);
 
 
@@ -181,9 +197,12 @@ public:
             }
 
 
-        //- Recompute the values (serial; structure regenerated from the
-        //  matrix, expected to be identical for an unchanged mesh)
+        //- Recompute the values only (serial, no halo entries)
         void updateValues(const lduMatrix& matrix);
+
+        //- Recompute the values only, using the cached structure. Falls back
+        //  to a full rebuild if the structure is not cacheable.
+        void updateValues(const lduMatrix& matrix, const List<Entry>& extra);
 
 
     // Member Operators

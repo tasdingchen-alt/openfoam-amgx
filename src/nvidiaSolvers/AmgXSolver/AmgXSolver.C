@@ -32,6 +32,7 @@ License
 
 #include <sstream>
 #include <vector>
+#include <chrono>
 #include <map>
 #include <memory>
 
@@ -127,7 +128,8 @@ Foam::AmgXSolver::AmgXSolver
     coarseSolver_("NOSOLVER"),
     interpolator_("D2"),
     selector_("SIZE_2"),
-    maxLevels_(50)
+    maxLevels_(50),
+    gmresRestart_(32)
 {
     // Solver options live in the "AmgX" sub-dictionary
     const dictionary& amgxDict = controlDict_.subOrEmptyDict("AmgX");
@@ -144,6 +146,7 @@ Foam::AmgXSolver::AmgXSolver
     interpolator_ = amgxDict.lookupOrDefault<word>("interpolator", "D2");
     selector_ = amgxDict.lookupOrDefault<word>("selector", "SIZE_2");
     maxLevels_ = amgxDict.lookupOrDefault<label>("maxLevels", 50);
+    gmresRestart_ = amgxDict.lookupOrDefault<label>("gmresRestart", 32);
 }
 
 
@@ -214,7 +217,7 @@ std::string Foam::AmgXSolver::defaultConfig() const
         <<   "\"obtain_timings\": " << (verbose_ ? 1 : 0) << ", "
         <<   "\"max_iters\": " << maxIter_ << ", "
         <<   "\"monitor_residual\": 1, "
-        <<   "\"gmres_n_restart\": 32, "
+        <<   "\"gmres_n_restart\": " << gmresRestart_ << ", "
         <<   "\"convergence\": \"RELATIVE_INI\", "
         <<   "\"scope\": \"main\", "
         <<   "\"tolerance\": " << amgxTol << ", "
@@ -461,8 +464,11 @@ std::string Foam::AmgXSolver::stateKey() const
 {
     std::ostringstream key;
 
+    // Share one AmgX state (AMG hierarchy + Krylov workspace) per
+    // field/mesh/parallelism. Tolerances are handled by OpenFOAM; including
+    // them here would create separate GPU states for e.g. p and pFinal,
+    // roughly doubling VRAM usage for no benefit.
     key << fieldName_ << ':' << static_cast<const void*>(&matrix_.mesh())
-        << ':' << relTol_ << ':' << tolerance_ << ':' << maxIter_
         << ':' << int(Pstream::parRun());
 
     return key.str();
@@ -676,6 +682,12 @@ Foam::solverPerformance Foam::AmgXSolver::solve
 {
     solverPerformance solverPerf(typeName, fieldName_);
 
+    static std::map<std::string, std::vector<double> > amgxProf;
+    std::vector<double>& prof = amgxProf[fieldName_];
+    if (prof.empty()) prof.assign(4, 0.0);
+    const std::chrono::steady_clock::time_point tStart =
+        std::chrono::steady_clock::now();
+
     const label nCells = psi.size();
     const label nFaces = matrix_.upper().size();
 
@@ -722,6 +734,9 @@ Foam::solverPerformance Foam::AmgXSolver::solve
     // --- Matrix upload / coefficient update ---
     uploadMatrix(st);
 
+    const std::chrono::steady_clock::time_point tAsm =
+        std::chrono::steady_clock::now();
+
     // --- (Re)build the AMG hierarchy when required ---
     if (st.needSetup || setupEveryTime_)
     {
@@ -740,6 +755,9 @@ Foam::solverPerformance Foam::AmgXSolver::solve
     // --- Upload vectors, solve, download ---
     solverPerf.nIterations() = solveAmgX(st, psi, rhs);
 
+    const std::chrono::steady_clock::time_point tSolve =
+        std::chrono::steady_clock::now();
+
     AMGX_SOLVE_STATUS status;
     AMGX_CHECK_CALL(AMGX_solver_get_status(st.solver, &status));
 
@@ -751,6 +769,21 @@ Foam::solverPerformance Foam::AmgXSolver::solve
 
     // --- Final residual, OpenFOAM-normalised ---
     solverPerf.finalResidual() = normalisedResidual(psi, source, cmpt);
+
+    const std::chrono::steady_clock::time_point tEnd =
+        std::chrono::steady_clock::now();
+
+    prof[0] += std::chrono::duration<double>(tAsm - tStart).count();
+    prof[1] += std::chrono::duration<double>(tSolve - tAsm).count();
+    prof[2] += std::chrono::duration<double>(tEnd - tSolve).count();
+    prof[3] += 1.0;
+    if (static_cast<label>(prof[3]) % 10 == 0)
+    {
+        Info<< "AmgX profile [" << fieldName_ << "]: calls=" << prof[3]
+            << " asm+upload=" << prof[0] << "s"
+            << " solve=" << prof[1] << "s"
+            << " residual=" << prof[2] << "s" << endl;
+    }
 
     solverPerf.checkConvergence(tolerance_, relTol_);
 

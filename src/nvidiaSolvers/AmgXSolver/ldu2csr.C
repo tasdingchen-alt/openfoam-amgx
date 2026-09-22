@@ -14,9 +14,9 @@ License
     option) any later version.
 
     openfoam-amgx is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
-    or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
-    for more details.
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+    Public License for more details.
 
     You should have received a copy of the GNU General Public License along
     with openfoam-amgx.  If not, see <https://www.gnu.org/licenses/>.
@@ -52,7 +52,7 @@ void Foam::ldu2csr::gather
     // Diagonal entries
     for (label cell = 0; cell < nCells; cell++)
     {
-        rows[cell].push_back(std::make_pair(rowStart + cell, diag[cell]));
+        rows[cell].push_back(Item{rowStart + cell, diag[cell], 0, cell});
     }
 
     // Off-diagonal entries of the internal faces
@@ -60,11 +60,11 @@ void Foam::ldu2csr::gather
     {
         rows[owner[face]].push_back
         (
-            std::make_pair(rowStart + neighbour[face], lower[face])
+            Item{rowStart + neighbour[face], lower[face], 1, face}
         );
         rows[neighbour[face]].push_back
         (
-            std::make_pair(rowStart + owner[face], upper[face])
+            Item{rowStart + owner[face], upper[face], 2, face}
         );
     }
 
@@ -72,7 +72,7 @@ void Foam::ldu2csr::gather
     forAll(extra, i)
     {
         const Entry& e = extra[i];
-        rows[e.row].push_back(std::make_pair(e.col, e.value));
+        rows[e.row].push_back(Item{e.col, e.value, 3, i});
     }
 }
 
@@ -82,6 +82,8 @@ void Foam::ldu2csr::flatten(std::vector<Row>& rows)
     nRows_ = rows.size();
     nNonZeros_ = 0;
 
+    bool duplicates = false;
+
     for (label cell = 0; cell < nRows_; cell++)
     {
         Row& row = rows[cell];
@@ -90,9 +92,9 @@ void Foam::ldu2csr::flatten(std::vector<Row>& rows)
         (
             row.begin(),
             row.end(),
-            [](const std::pair<label, scalar>& a, const std::pair<label, scalar>& b)
+            [](const Item& a, const Item& b)
             {
-                return a.first < b.first;
+                return a.col < b.col;
             }
         );
 
@@ -100,11 +102,12 @@ void Foam::ldu2csr::flatten(std::vector<Row>& rows)
         Row merged;
         merged.reserve(row.size());
 
-        for (const std::pair<label, scalar>& entry : row)
+        for (const Item& entry : row)
         {
-            if (!merged.empty() && merged.back().first == entry.first)
+            if (!merged.empty() && merged.back().col == entry.col)
             {
-                merged.back().second += entry.second;
+                merged.back().val += entry.val;
+                duplicates = true;
             }
             else
             {
@@ -121,15 +124,35 @@ void Foam::ldu2csr::flatten(std::vector<Row>& rows)
     colInd_.setSize(nNonZeros_);
     values_.setSize(nNonZeros_);
 
+    cacheable_ = !duplicates;
+
+    if (cacheable_)
+    {
+        srcType_.setSize(nNonZeros_);
+        srcIndex_.setSize(nNonZeros_);
+    }
+    else
+    {
+        srcType_.clear();
+        srcIndex_.clear();
+    }
+
     label idx = 0;
     rowPtr_[0] = 0;
 
     for (label cell = 0; cell < nRows_; cell++)
     {
-        for (const std::pair<label, scalar>& entry : rows[cell])
+        for (const Item& entry : rows[cell])
         {
-            colInd_[idx] = entry.first;
-            values_[idx] = entry.second;
+            colInd_[idx] = entry.col;
+            values_[idx] = entry.val;
+
+            if (cacheable_)
+            {
+                srcType_[idx] = entry.src;
+                srcIndex_[idx] = entry.idx;
+            }
+
             idx++;
         }
 
@@ -146,7 +169,10 @@ Foam::ldu2csr::ldu2csr(const lduMatrix& matrix)
     nNonZeros_(0),
     rowPtr_(),
     colInd_(),
-    values_()
+    values_(),
+    srcType_(),
+    srcIndex_(),
+    cacheable_(false)
 {
     std::vector<Row> rows;
     gather(matrix, 0, List<Entry>(), rows);
@@ -165,7 +191,10 @@ Foam::ldu2csr::ldu2csr
     nNonZeros_(0),
     rowPtr_(),
     colInd_(),
-    values_()
+    values_(),
+    srcType_(),
+    srcIndex_(),
+    cacheable_(false)
 {
     std::vector<Row> rows;
     gather(matrix, rowStart, extra, rows);
@@ -177,9 +206,48 @@ Foam::ldu2csr::ldu2csr
 
 void Foam::ldu2csr::updateValues(const lduMatrix& matrix)
 {
-    std::vector<Row> rows;
-    gather(matrix, 0, List<Entry>(), rows);
-    flatten(rows);
+    updateValues(matrix, List<Entry>());
+}
+
+
+void Foam::ldu2csr::updateValues(const lduMatrix& matrix, const List<Entry>& extra)
+{
+    if
+    (
+        !cacheable_
+     || srcType_.size() != nNonZeros_
+     || rowPtr_.size() != nRows_ + 1
+    )
+    {
+        // Structure is not reusable: rebuild everything
+        std::vector<Row> rows;
+        gather(matrix, 0, extra, rows);
+        flatten(rows);
+        return;
+    }
+
+    const scalarField& diag = matrix.diag();
+    const scalarField& upper = matrix.upper();
+    const scalarField& lower = matrix.lower();
+
+    const label* srcType = srcType_.begin();
+    const label* srcIndex = srcIndex_.begin();
+    scalar* vals = values_.begin();
+    const label nnz = nNonZeros_;
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (label i = 0; i < nnz; i++)
+    {
+        switch (srcType[i])
+        {
+            case 0: vals[i] = diag[srcIndex[i]]; break;
+            case 1: vals[i] = lower[srcIndex[i]]; break;
+            case 2: vals[i] = upper[srcIndex[i]]; break;
+            default: vals[i] = extra[srcIndex[i]].value; break;
+        }
+    }
 }
 
 
